@@ -1,0 +1,99 @@
+# Claude Agent Starter
+
+A full-stack EdgeOne Makers Agent template — streaming chat backed by the Claude Agent SDK, with EdgeOne sandbox tools wired in via MCP and conversation memory persisted through `context.agent.store`.
+
+**Framework:** Claude Agent SDK · **Category:** Quick Start <!-- TODO: confirm --> · **Language:** TypeScript
+
+[![Deploy to EdgeOne Makers](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/makers/new?template=claude-agent-starter-node&from=within&fromAgent=1&agentLang=typescript)
+
+<!-- ![preview](./assets/preview.png)  TODO: confirm -->
+
+## Overview
+
+A minimal, production-shaped starter that wires the Claude Agent SDK into EdgeOne Makers. It demonstrates the full chat loop — SSE streaming, tool calling against the EdgeOne sandbox, conversation persistence — so you can fork it and start replacing prompts and tools instead of plumbing.
+
+- **SSE streaming chat** — token-by-token `text_delta` events, plus `tool_called` events whenever the model invokes a tool.
+- **Sandbox tools via MCP** — `commands`, `files`, `code_interpreter`, `browser` are exposed to Claude as a single MCP server through `context.tools.toClaudeMcpServer()`.
+- **Sticky conversation memory** — Claude transcript stored in `context.agent.store.claude_session_store()`; user/assistant messages mirrored via `store.appendMessage()` for replayable history.
+- **Dual cancellation** — frontend `AbortController` plus backend `context.utils.abortActiveRun()` so `/stop` actually releases the upstream LLM connection.
+- **Two-folder backend** — long-running stateful work in `agents/`, short stateless CRUD in `cloud-functions/`, keeping history/list/delete requests off the agents process so they don't compete with an active chat for runtime resources.
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `AI_GATEWAY_API_KEY` | Yes | Model gateway API key. Use your Makers Models API Key, or any OpenAI-compatible provider key. |
+| `AI_GATEWAY_BASE_URL` | Yes | Gateway base URL. For Makers Models, use `https://ai-gateway.edgeone.link/v1`. |
+| `AI_GATEWAY_MODEL` | No | Model ID. Defaults to `@makers/deepseek-v4-flash` (a free built-in model). |
+| `WSA_API_KEY` | No | Tencent Cloud Web Search API key. Required only if you use the web-search tool. See [How to get `WSA_API_KEY`](#how-to-get-wsa_api_key). |
+
+This template follows the OpenAI-compatible standard — point these at Makers Models or any compatible provider.
+
+### How to get `AI_GATEWAY_API_KEY`
+
+1. Open the [Makers Console](https://console.cloud.tencent.com/edgeone/makers).
+2. Sign in and enable Makers.
+3. Go to **Makers → Models → API Key** and create a key.
+4. Copy it into `AI_GATEWAY_API_KEY`.
+
+The built-in `@makers/deepseek-v4-flash` model is free with a usage cap and is suitable for prototyping. For production, bind your own paid provider (BYOK).
+
+### How to get `WSA_API_KEY`
+
+`WSA_API_KEY` is only needed if you call the web-search tool. Apply for one on the [Tencent Cloud Web Search Agent product page](https://cloud.tencent.com/product/wsa), then copy the issued key into `WSA_API_KEY`.
+
+### Provider fallbacks
+
+This template's `agents/_model.ts` also reads `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS` directly — useful if you want to call the Anthropic API instead of going through a gateway. If both are present, the gateway variables take precedence. Set `CLAUDE_MODEL` (or `AI_GATEWAY_MODEL`) to override the default model, and `ANTHROPIC_SMALL_FAST_MODEL` / `AI_GATEWAY_SMALL_MODEL` to override the small model the SDK uses for internal sub-calls.
+
+## Local Development
+
+Prerequisites: Node.js ≥ 18 and the EdgeOne CLI (`npm i -g edgeone`).
+
+```bash
+npm install
+cp .env.example .env       # then fill in AI_GATEWAY_API_KEY / AI_GATEWAY_BASE_URL
+edgeone makers dev
+```
+
+Local agent metrics & traces are exposed at `http://localhost:8080/agent-metrics`.
+
+## Project Structure
+
+```text
+claude-agent-starter/
+├── agents/                          # Stateful EdgeOne Makers Agent Functions (Node/TS)
+│   ├── chat/index.ts               # POST /chat — SSE streaming chat
+│   ├── stop/index.ts               # POST /stop — abort active agent run
+│   ├── _model.ts                   # Model & gateway env config (private)
+│   └── _logger.ts                  # Logger utility (private)
+├── cloud-functions/                 # Stateless EdgeOne Pages Node Functions
+│   ├── history/index.ts            # POST /history — load conversation messages
+│   ├── conversations/index.ts      # POST /conversations — list a user's conversations
+│   ├── clear-history/index.ts      # POST /clear-history — clear messages of one conversation
+│   ├── delete-conversation/index.ts # POST /delete-conversation — delete a conversation entirely
+│   ├── _logger.ts                  # Logger utility
+│   └── _redact.ts                  # Sensitive-field redactor for logs
+├── src/                             # React + Vite + TypeScript frontend
+│   ├── App.tsx                     # Conversation ID + SSE stream orchestration
+│   ├── api.ts                      # /chat, /stop, /history, ... wrappers and SSE parser
+│   └── components/                 # ChatWindow, ChatInput, CodeViewer, ToolIndicators, ...
+├── package.json                     # Dependencies (includes Claude Agent SDK)
+├── edgeone.json                     # EdgeOne deployment config
+├── .env.example                     # Environment variables template
+├── vite.config.ts
+├── tsconfig.json
+└── index.html
+```
+
+> Files prefixed with `_` are private modules — not exposed as public routes.
+
+## Resources
+
+- [EdgeOne Makers Agents — Documentation](https://pages.edgeone.ai/document/agents)
+- [EdgeOne Makers — Quick Start](https://pages.edgeone.ai/document/agents-quickstart)
+- [Makers Models](https://pages.edgeone.ai/document/models)
+
+## License
+
+MIT.
