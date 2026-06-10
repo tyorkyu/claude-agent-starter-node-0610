@@ -29,6 +29,8 @@ export interface TaskRecord {
   conversationId: string;
   status: TaskStatus;
   httpStatus?: number;
+  /** Platform-side request id surfaced via response headers (for cross-checking function logs). */
+  requestId?: string;
   startedAt: number;
   firstByteAt?: number;
   endedAt?: number;
@@ -37,6 +39,8 @@ export interface TaskRecord {
   errorRaw?: string;
   textPreview: string;
   rawEvents: TaskRawEvent[];
+  /** True only when a SSE `done` event was actually received. */
+  doneReceived: boolean;
 }
 
 export interface RunnerCallbacks {
@@ -116,6 +120,15 @@ export async function runSingleTask(
 
   task.httpStatus = res.status;
   task.firstByteAt = Date.now();
+  // Capture the platform request id so we can pivot from a "frontend success"
+  // to the actual cloud-function invocation logs (multiple invocations may
+  // back one fetch due to OOM-driven internal retries).
+  task.requestId =
+    res.headers.get('x-request-id') ||
+    res.headers.get('x-tencent-request-id') ||
+    res.headers.get('x-trace-id') ||
+    res.headers.get('request-id') ||
+    undefined;
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -197,6 +210,7 @@ export async function runSingleTask(
             task.status = 'error';
           }
         } else if (eventType === 'done') {
+          task.doneReceived = true;
           // success only when not previously marked as error/rate_limited
           if (task.status === 'running') {
             task.status = 'success';
@@ -215,9 +229,15 @@ export async function runSingleTask(
     }
   } finally {
     task.endedAt = Date.now();
-    if (task.status === 'running') {
-      // stream closed without explicit done — treat as success-ish
-      task.status = 'success';
+    // Strict success contract: only count as success when the SSE `done` event
+    // was actually received. Otherwise the stream was cut mid-flight (likely
+    // upstream OOM / instance recycle / proxy timeout) — surface it as an
+    // error so the bench numbers match the cloud-function failure metrics.
+    if (!task.doneReceived) {
+      if (task.status === 'success' || task.status === 'running' || task.status === 'connecting') {
+        task.status = 'error';
+        task.errorMessage = task.errorMessage || 'stream closed without done event';
+      }
     }
     callbacks.onTaskUpdate(task);
   }

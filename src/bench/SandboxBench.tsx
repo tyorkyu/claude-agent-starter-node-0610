@@ -38,6 +38,27 @@ function fmtMs(ms?: number): string {
   return `${(ms / 1000).toFixed(2)}s`;
 }
 
+/**
+ * Highlight unusually long latency as a hint of upstream retries / instance churn.
+ * Normal /chat SSE first byte is sub-second; tens of seconds usually means the
+ * platform silently retried the request through another instance (e.g. after
+ * an OOM kill on the first one).
+ */
+function ttfbColor(ms?: number): string | undefined {
+  if (ms == null) return undefined;
+  if (ms >= 120_000) return '#c0392b';   // > 120s — almost certainly a retry chain
+  if (ms >= 30_000) return '#d4881a';    // > 30s  — suspicious
+  if (ms >= 5_000) return '#b8a02a';     // > 5s   — slower than expected
+  return undefined;
+}
+
+function durationColor(ms?: number): string | undefined {
+  if (ms == null) return undefined;
+  if (ms >= 180_000) return '#c0392b';
+  if (ms >= 60_000) return '#d4881a';
+  return undefined;
+}
+
 export function SandboxBench() {
   const [concurrency, setConcurrency] = useState(25);
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
@@ -66,6 +87,7 @@ export function SandboxBench() {
       toolCalls: [],
       textPreview: '',
       rawEvents: [],
+      doneReceived: false,
     }));
     tasksRef.current = initial;
     setTasks(initial);
@@ -175,6 +197,7 @@ export function SandboxBench() {
             <tr>
               <th>#</th>
               <th>conversation_id</th>
+              <th>request-id</th>
               <th>状态</th>
               <th>HTTP</th>
               <th>TTFB</th>
@@ -193,13 +216,16 @@ export function SandboxBench() {
                 <tr key={t.conversationId} className={selectedIdx === t.index ? 'selected' : ''}>
                   <td>{t.index}</td>
                   <td className="mono small">{t.conversationId.slice(0, 8)}…</td>
+                  <td className="mono small" title={t.requestId || ''}>
+                    {t.requestId ? `${t.requestId.slice(0, 10)}…` : '-'}
+                  </td>
                   <td>
                     <span className="status-dot" style={{ background: statusColor(t.status) }} />
                     {t.status}
                   </td>
                   <td>{t.httpStatus ?? '-'}</td>
-                  <td>{fmtMs(ttfb)}</td>
-                  <td>{fmtMs(dur)}</td>
+                  <td style={{ color: ttfbColor(ttfb) }}>{fmtMs(ttfb)}</td>
+                  <td style={{ color: durationColor(dur) }}>{fmtMs(dur)}</td>
                   <td className="mono small">{t.toolCalls.join(',')}</td>
                   <td className="summary-cell">{summary.slice(0, 120)}</td>
                   <td>
@@ -210,7 +236,7 @@ export function SandboxBench() {
             })}
             {tasks.length === 0 && (
               <tr>
-                <td colSpan={9} style={{ textAlign: 'center', color: '#888', padding: 24 }}>
+                <td colSpan={10} style={{ textAlign: 'center', color: '#888', padding: 24 }}>
                   尚未开始测试
                 </td>
               </tr>
@@ -228,6 +254,7 @@ export function SandboxBench() {
           <div className="detail-meta">
             <span>状态：{selected.status}</span>
             <span>HTTP：{selected.httpStatus ?? '-'}</span>
+            <span>request-id：{selected.requestId ?? '-'}</span>
             <span>tool：{selected.toolCalls.join(', ') || '-'}</span>
           </div>
           {selected.errorRaw && (
