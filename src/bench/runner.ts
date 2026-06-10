@@ -233,8 +233,12 @@ export async function runSingleTask(
     // was actually received. Otherwise the stream was cut mid-flight (likely
     // upstream OOM / instance recycle / proxy timeout) — surface it as an
     // error so the bench numbers match the cloud-function failure metrics.
+    //
+    // Cast through TaskStatus to avoid TS narrowing the union to just the
+    // failure subset by the time control flow reaches `finally`.
     if (!task.doneReceived) {
-      if (task.status === 'success' || task.status === 'running' || task.status === 'connecting') {
+      const finalStatus: TaskStatus = task.status;
+      if (finalStatus !== 'error' && finalStatus !== 'rate_limited' && finalStatus !== 'aborted') {
         task.status = 'error';
         task.errorMessage = task.errorMessage || 'stream closed without done event';
       }
