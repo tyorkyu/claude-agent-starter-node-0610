@@ -246,3 +246,53 @@ export async function runSingleTask(
     callbacks.onTaskUpdate(task);
   }
 }
+
+/**
+ * Pool-based concurrency limiter.
+ *
+ * Why this exists: HTTP/1.1 caps a single origin at ~6 concurrent connections
+ * per browser. Without throttling, the bench fires N fetches at once, the
+ * first 6 actually leave the browser, and the rest sit in the browser-side
+ * pending queue with no visibility — the platform never sees them, so any
+ * sandbox / function metric we collect is wrong by construction.
+ *
+ * `runWithLimit` keeps at most `inFlightLimit` tasks in flight; as soon as
+ * one task settles (success / error / rate_limited / aborted) the next pending
+ * task is started. Tasks remain in pool order so the bench's `index` keeps
+ * matching the order in the table.
+ *
+ * The function resolves once every task has reached a terminal state.
+ */
+export async function runWithLimit(
+  tasks: TaskRecord[],
+  prompt: string,
+  callbacks: RunnerCallbacks,
+  signal: AbortSignal,
+  inFlightLimit: number,
+): Promise<void> {
+  const limit = Math.max(1, Math.floor(inFlightLimit));
+  let cursor = 0;
+
+  async function worker(): Promise<void> {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (signal.aborted) return;
+      const next = cursor++;
+      if (next >= tasks.length) return;
+      const task = tasks[next];
+      task.startedAt = Date.now();
+      try {
+        await runSingleTask(task, prompt, callbacks, signal);
+      } catch {
+        // runSingleTask handles its own errors; defensive guard so one
+        // failing task can't take down the worker loop.
+      }
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(limit, tasks.length) },
+    () => worker(),
+  );
+  await Promise.all(workers);
+}

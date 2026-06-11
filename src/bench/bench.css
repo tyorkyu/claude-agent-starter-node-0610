@@ -65,6 +65,11 @@ html, body, #root {
   border-radius: 4px;
   font-size: 14px;
 }
+.bench-controls .hint {
+  color: var(--fg-dim);
+  font-size: 11px;
+  margin-top: 2px;
+}
 .bench-actions {
   display: flex;
   gap: 8px;

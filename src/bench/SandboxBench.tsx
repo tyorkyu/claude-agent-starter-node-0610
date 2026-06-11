@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
-import { runSingleTask, type TaskRecord, type TaskStatus } from './runner';
+import { runWithLimit, type TaskRecord, type TaskStatus } from './runner';
 
 const DEFAULT_PROMPT =
   "Use the code_interpreter tool to run this Python snippet exactly once and reply with the printed line:\n" +
@@ -60,7 +60,12 @@ function durationColor(ms?: number): string | undefined {
 }
 
 export function SandboxBench() {
-  const [concurrency, setConcurrency] = useState(25);
+  const [totalTasks, setTotalTasks] = useState(25);
+  // HTTP/1.1 browsers cap concurrent connections per origin at ~6, and even
+  // on H2 the server / proxy may impose a similar limit. Default to 6 so
+  // the bench actually puts pressure on the platform instead of letting
+  // most requests pile up in the browser's pending queue.
+  const [inFlightLimit, setInFlightLimit] = useState(6);
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   const [running, setRunning] = useState(false);
@@ -78,7 +83,8 @@ export function SandboxBench() {
 
   const start = useCallback(async () => {
     if (running) return;
-    const n = Math.max(1, Math.min(200, Math.floor(concurrency)));
+    const n = Math.max(1, Math.min(500, Math.floor(totalTasks)));
+    const limit = Math.max(1, Math.min(n, Math.floor(inFlightLimit)));
     const initial: TaskRecord[] = Array.from({ length: n }, (_, i) => ({
       index: i,
       conversationId: uuid(),
@@ -97,18 +103,13 @@ export function SandboxBench() {
     abortRef.current = ac;
     setRunning(true);
 
-    const now = Date.now();
-    const promises = initial.map((t) => {
-      t.startedAt = now;
-      return runSingleTask(t, prompt, { onTaskUpdate }, ac.signal);
-    });
     try {
-      await Promise.allSettled(promises);
+      await runWithLimit(initial, prompt, { onTaskUpdate }, ac.signal, limit);
     } finally {
       setRunning(false);
       abortRef.current = null;
     }
-  }, [concurrency, prompt, running, onTaskUpdate]);
+  }, [totalTasks, inFlightLimit, prompt, running, onTaskUpdate]);
 
   const stopAll = useCallback(() => {
     abortRef.current?.abort();
@@ -150,15 +151,27 @@ export function SandboxBench() {
 
       <section className="bench-controls">
         <label>
-          并发数
+          总任务数
           <input
             type="number"
             min={1}
-            max={200}
-            value={concurrency}
+            max={500}
+            value={totalTasks}
             disabled={running}
-            onChange={(e) => setConcurrency(parseInt(e.target.value, 10) || 1)}
+            onChange={(e) => setTotalTasks(parseInt(e.target.value, 10) || 1)}
           />
+        </label>
+        <label>
+          飞行上限
+          <input
+            type="number"
+            min={1}
+            max={50}
+            value={inFlightLimit}
+            disabled={running}
+            onChange={(e) => setInFlightLimit(parseInt(e.target.value, 10) || 1)}
+          />
+          <span className="hint">同时在飞 ≤ N（默认 6，绕开浏览器同源连接上限）</span>
         </label>
         <div className="bench-actions">
           <button className="primary" onClick={start} disabled={running}>
@@ -180,13 +193,14 @@ export function SandboxBench() {
       </section>
 
       <section className="bench-stats">
-        <Stat label="实时并发" value={`${stats.liveConcurrency}`} accent="#1f7ae0" />
+        <Stat label="飞行中" value={`${stats.liveConcurrency}`} accent="#1f7ae0" />
+        <Stat label="池内等待" value={`${stats.counts.pending}`} />
         <Stat label="总任务" value={`${stats.total}`} />
         <Stat label="成功" value={`${stats.counts.success}`} accent="#1aa260" />
         <Stat label="限流/超并发" value={`${stats.counts.rate_limited}`} accent="#d4881a" />
         <Stat label="错误" value={`${stats.counts.error}`} accent="#c0392b" />
-        <Stat label="排队中" value={`${stats.counts.pending + stats.counts.connecting}`} />
-        <Stat label="运行中" value={`${stats.counts.running}`} accent="#0a8a4a" />
+        <Stat label="connecting" value={`${stats.counts.connecting}`} />
+        <Stat label="running" value={`${stats.counts.running}`} accent="#0a8a4a" />
         <Stat label="中止" value={`${stats.counts.aborted}`} />
         <Stat label="平均耗时" value={fmtMs(stats.avg)} />
       </section>
