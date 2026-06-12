@@ -110,6 +110,112 @@ function emitToolResultImages(
   }
 }
 
+/**
+ * Trace timer for diagnosing where time is spent inside `query()`.
+ *
+ * Emits two kinds of timestamps for every event:
+ *   t = elapsed since query() began
+ *   d = delta since last trace event (i.e. "how long was this gap?")
+ *
+ * Plus a per-tool-use clock (toolUse → tool_result) so we can pinpoint slow
+ * tools (sandbox commands, code_interpreter, browser, etc.).
+ *
+ * Usage in chat logs (paste into your dev console / log aggregator):
+ *   grep '\[trace\]'   → linear timeline
+ *   grep 'tool='       → per-tool latency
+ *   grep '\[trace\] summary' → final breakdown
+ */
+function createTraceTimer(logger: Logger, tag: string) {
+  const startedAt = Date.now();
+  let lastAt = startedAt;
+
+  /** Cumulative time spent in each phase (rough categorization). */
+  const phase = {
+    sdkBoot: 0,        // query() start → first SDK message
+    llmInfer: 0,       // last tool_result (or boot) → next assistant msg
+    toolExec: 0,       // assistant w/ tool_use → corresponding tool_result
+    other: 0,
+  };
+
+  /** Per-tool inflight tracker. Keyed by tool_use_id (block.id). */
+  const toolInflight = new Map<string, { tool: string; startedAt: number }>();
+
+  /** Per-tool aggregated stats. */
+  const toolStats = new Map<string, { count: number; totalMs: number; maxMs: number }>();
+
+  /** What kind of work is currently running, used to attribute gap time. */
+  let currentPhase: 'sdkBoot' | 'llmInfer' | 'toolExec' | 'other' = 'sdkBoot';
+
+  function fmt(ms: number): string {
+    return `${(ms / 1000).toFixed(2)}s`;
+  }
+
+  function event(label: string, extra?: Record<string, unknown>): void {
+    const now = Date.now();
+    const t = now - startedAt;
+    const d = now - lastAt;
+    lastAt = now;
+
+    // Attribute the just-elapsed gap (`d`) to whichever phase we were in.
+    phase[currentPhase] += d;
+
+    const extraStr = extra && Object.keys(extra).length > 0
+      ? ' ' + Object.entries(extra)
+        .map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
+        .join(' ')
+      : '';
+    logger.log(`[trace][${tag}] ${label} t=${fmt(t)} d=${fmt(d)}${extraStr}`);
+  }
+
+  function setPhase(p: typeof currentPhase): void {
+    currentPhase = p;
+  }
+
+  function toolStarted(toolUseId: string | undefined, tool: string): void {
+    if (!toolUseId) return;
+    toolInflight.set(toolUseId, { tool, startedAt: Date.now() });
+  }
+
+  function toolFinished(toolUseId: string | undefined): void {
+    if (!toolUseId) return;
+    const inflight = toolInflight.get(toolUseId);
+    if (!inflight) return;
+    toolInflight.delete(toolUseId);
+    const ms = Date.now() - inflight.startedAt;
+    const cur = toolStats.get(inflight.tool) ?? { count: 0, totalMs: 0, maxMs: 0 };
+    cur.count += 1;
+    cur.totalMs += ms;
+    if (ms > cur.maxMs) cur.maxMs = ms;
+    toolStats.set(inflight.tool, cur);
+    logger.log(`[trace][${tag}] tool_done tool=${inflight.tool} ms=${ms} t=${fmt(Date.now() - startedAt)}`);
+  }
+
+  function summary(): void {
+    const totalMs = Date.now() - startedAt;
+    const tools: Record<string, { count: number; totalMs: number; avgMs: number; maxMs: number }> = {};
+    for (const [name, s] of toolStats) {
+      tools[name] = {
+        count: s.count,
+        totalMs: s.totalMs,
+        avgMs: Math.round(s.totalMs / s.count),
+        maxMs: s.maxMs,
+      };
+    }
+    logger.log(
+      `[trace][${tag}] summary total=${fmt(totalMs)}`,
+      'phases=' + JSON.stringify({
+        sdkBoot:   `${(phase.sdkBoot / 1000).toFixed(2)}s`,
+        llmInfer:  `${(phase.llmInfer / 1000).toFixed(2)}s`,
+        toolExec:  `${(phase.toolExec / 1000).toFixed(2)}s`,
+        other:     `${(phase.other / 1000).toFixed(2)}s`,
+      }),
+      'tools=' + JSON.stringify(tools),
+    );
+  }
+
+  return { event, setPhase, toolStarted, toolFinished, summary };
+}
+
 function emitDebugMessage(
   msg: any,
   controller: ReadableStreamDefaultController<Uint8Array>,
@@ -131,6 +237,7 @@ function emitAssistantBlocks(
   encoder: TextEncoder,
   logger: Logger,
   conversationId: string,
+  trace?: ReturnType<typeof createTraceTimer>,
 ): void {
   const blocks = msg.message?.content ?? [];
   for (let idx = 0; idx < blocks.length; idx++) {
@@ -163,6 +270,11 @@ function emitAssistantBlocks(
           inputPreview: safeJsonPreview(toolInput),
         },
       );
+
+      // Trace: this assistant block requests a tool call. Start the timer for
+      // it; we'll close it when the matching tool_result message arrives.
+      trace?.toolStarted(typeof toolId === 'string' ? toolId : undefined, toolName);
+      trace?.event('tool_use', { tool: toolName, idx, id: typeof toolId === 'string' ? toolId.slice(0, 8) : '-' });
 
       enqueueSse(controller, encoder, 'tool_called', { tool: toolName });
 
@@ -212,6 +324,11 @@ export function createChatStream({
     sentTextLenByBlock: new Map<number, number>(),
   };
 
+  // Tag traces with a short cid prefix so concurrent requests are easy to
+  // separate in shared logs.
+  const traceTag = conversationId ? conversationId.slice(0, 8) : 'no-cid';
+  const trace = createTraceTimer(logger, traceTag);
+
   return new ReadableStream({
     async start(controller) {
       try {
@@ -233,19 +350,70 @@ export function createChatStream({
           signal?.addEventListener('abort', () => abortController.abort(), { once: true });
         }
 
+        trace.event('query_begin');
+        // Phase: from query() begin until first SDK message arrives.
+        // This captures CLI subprocess fork + SDK initialization + first
+        // round trip to the LLM gateway.
+        trace.setPhase('sdkBoot');
+
         const q = query({
           prompt: message,
           options: { ...options, abortController },
         });
         let lastMsgType = '';
+        let firstMsgSeen = false;
 
         for await (const msg of q) {
           if (signal?.aborted) { stopped = true; break; }
+
+          // First SDK message: end of "sdkBoot" phase.
+          if (!firstMsgSeen) {
+            firstMsgSeen = true;
+            trace.event('first_msg', { type: msg.type });
+            trace.setPhase('llmInfer');
+          }
 
           // New assistant message round detected: if previous was user (tool_result), reset counters.
           if (msg.type === 'assistant' && lastMsgType === 'user') {
             state.sentTextLenByBlock.clear();
           }
+
+          // Trace per message type. The phase attribution below assumes the
+          // common Claude conversation pattern:
+          //   assistant(text|tool_use) → user(tool_result) → assistant(...) → result
+          // user(tool_result) closes a toolExec window; assistant after a
+          // user message opens a new llmInfer window.
+          if (msg.type === 'system') {
+            const subtype = (msg as { subtype?: string }).subtype;
+            trace.event('system', { subtype });
+          } else if (msg.type === 'assistant') {
+            const blocks = (msg.message?.content ?? []) as Array<{ type?: string }>;
+            const blockTypes = blocks.map(b => b.type ?? '?').join(',');
+            trace.event('assistant', { blocks: blockTypes });
+            // If this assistant turn requests tools, the next phase is toolExec;
+            // otherwise it's just text and we stay in llmInfer until result.
+            const hasToolUse = blocks.some(b => b.type === 'tool_use');
+            if (hasToolUse) {
+              trace.setPhase('toolExec');
+            }
+          } else if (msg.type === 'user') {
+            // user-typed messages from the SDK are tool_result wrappers.
+            // Match them to inflight tool_use ids so we can charge time per tool.
+            // Cast through unknown because the SDK's ContentBlockParam[] type
+            // is narrower than the dynamic shape we need to inspect at runtime.
+            const rawContent = msg.message?.content ?? [];
+            const content = (Array.isArray(rawContent) ? rawContent : []) as unknown as Array<Record<string, unknown>>;
+            const toolResults = content.filter(c => c?.type === 'tool_result');
+            for (const tr of toolResults) {
+              const toolUseId = typeof tr.tool_use_id === 'string' ? tr.tool_use_id : undefined;
+              trace.toolFinished(toolUseId);
+            }
+            trace.event('tool_result', { count: toolResults.length });
+            // After tool result we go back into LLM inference for the next
+            // assistant turn.
+            trace.setPhase('llmInfer');
+          }
+
           lastMsgType = msg.type;
 
           // Intercept base64Image from tool_result and push as image event to frontend.
@@ -257,8 +425,9 @@ export function createChatStream({
           emitDebugMessage(msg, controller, encoder);
 
           if (msg.type === 'assistant') {
-            emitAssistantBlocks(msg, state, controller, encoder, logger, conversationId);
+            emitAssistantBlocks(msg, state, controller, encoder, logger, conversationId, trace);
           } else if (msg.type === 'result') {
+            trace.event('result');
             const sessionId = msg.session_id;
             if (typeof sessionId === 'string') {
               logger.log('[session] Claude SDK result session_id:', sessionId);
@@ -319,6 +488,10 @@ export function createChatStream({
           }
           catch (e) { logger.error('[store] failed to save assistant response:', e); }
         }
+
+        // Final timing summary — single line that aggregates phases and
+        // per-tool latency. Look for `[trace][...] summary` to find it.
+        try { trace.summary(); } catch { /* logging must never throw */ }
 
         enqueueSse(controller, encoder, 'done', { stopped });
         controller.close();
